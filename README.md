@@ -105,7 +105,7 @@ Dans **ce dépôt** (Settings → Secrets and variables → Actions) :
 
 Dans **ditstock_backend** et **ditstock_frontend** : `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, la variable
 `DEPLOYMENT_REPO` = `Mj2k-styles/ditstock_deployment` et le secret `DEPLOYMENT_TOKEN` (jeton GitHub
-fine-grained, accès à ce dépôt, permission *Actions : write* — ou *Contents : write*).
+fine-grained, accès à ce dépôt, permission *Contents : Read and write*, exigée par `repository_dispatch`).
 
 ## Déployer à la main
 
