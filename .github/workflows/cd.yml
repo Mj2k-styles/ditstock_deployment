@@ -1,0 +1,253 @@
+# CD de DitStock (GitHub Actions + Kubernetes)
+#
+# Déclencheurs :
+#   - repository_dispatch « image-publiee » : envoyé par la CI de ditstock_backend ou
+#     ditstock_frontend après la publication d'une image sur Docker Hub ;
+#   - push sur main (modification des manifests) ;
+#   - lancement manuel (onglet Actions), avec le choix des tags.
+#
+# Étapes :
+#   1. récupération des manifests et accès au cluster (kind : Kubernetes dans le runner)
+#   2. kubectl apply -f des manifests (images Docker Hub au tag demandé)
+#   3. vérifications post-déploiement : kubectl rollout status, /health, frontend, API
+#   4. démonstration de la persistance (les données survivent au remplacement de la base)
+#   5. démonstration de la mise à jour sans interruption (rolling update sous trafic)
+#   6. notification : résumé dans GitHub Actions
+#
+# Configuration (Settings → Secrets and variables → Actions) :
+#   variable DOCKERHUB_USERNAME   compte Docker Hub des images ditstock-backend et ditstock-frontend
+name: CD Kubernetes
+
+on:
+  repository_dispatch:
+    types: [image-publiee]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      backend_tag:
+        description: "Tag de l'image backend (ex. sha-1a2b3c4)"
+        default: latest
+      frontend_tag:
+        description: "Tag de l'image frontend"
+        default: latest
+
+permissions:
+  contents: read
+
+# Un seul déploiement à la fois
+concurrency:
+  group: deploiement
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  NS: ditstock
+  APP_URL: http://localhost:8080
+
+jobs:
+  deploy:
+    name: Déploiement Kubernetes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # ── 1. Manifests et cluster ────────────────────────────────────────────
+      - name: Récupérer les manifests
+        uses: actions/checkout@v4
+
+      - name: Choisir les images à déployer
+        id: images
+        env:
+          EVENT: ${{ github.event_name }}
+          COMPOSANT: ${{ github.event.client_payload.composant }}
+          TAG_PUBLIE: ${{ github.event.client_payload.tag }}
+          INPUT_BACKEND: ${{ inputs.backend_tag }}
+          INPUT_FRONTEND: ${{ inputs.frontend_tag }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "::error::Variable DOCKERHUB_USERNAME absente : configurer Docker Hub (voir README)."
+            exit 1
+          fi
+          BACKEND_TAG=latest
+          FRONTEND_TAG=latest
+          case "$EVENT" in
+            repository_dispatch)
+              [ "$COMPOSANT" = backend ] && BACKEND_TAG="$TAG_PUBLIE"
+              [ "$COMPOSANT" = frontend ] && FRONTEND_TAG="$TAG_PUBLIE" ;;
+            workflow_dispatch)
+              BACKEND_TAG="${INPUT_BACKEND:-latest}"
+              FRONTEND_TAG="${INPUT_FRONTEND:-latest}" ;;
+          esac
+          # Un tag Docker ne contient que ces caractères (protège la suite du script)
+          for t in "$BACKEND_TAG" "$FRONTEND_TAG"; do
+            echo "$t" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$' || { echo "::error::Tag invalide : $t"; exit 1; }
+          done
+          {
+            echo "backend=$DOCKERHUB_USERNAME/ditstock-backend:$BACKEND_TAG"
+            echo "frontend=$DOCKERHUB_USERNAME/ditstock-frontend:$FRONTEND_TAG"
+            echo "backend_tag=$BACKEND_TAG"
+            echo "frontend_tag=$FRONTEND_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "Backend  : $DOCKERHUB_USERNAME/ditstock-backend:$BACKEND_TAG"
+          echo "Frontend : $DOCKERHUB_USERNAME/ditstock-frontend:$FRONTEND_TAG"
+
+      - name: Vérifier que les images existent sur Docker Hub
+        run: |
+          docker manifest inspect "${{ steps.images.outputs.backend }}" >/dev/null
+          docker manifest inspect "${{ steps.images.outputs.frontend }}" >/dev/null
+          echo "Images trouvées sur Docker Hub"
+
+      - name: Créer le cluster Kubernetes (kind)
+        uses: helm/kind-action@v1.15.2
+        with:
+          cluster_name: ditstock
+          config: kind/cluster.yaml
+
+      - name: Accès au cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      # ── 2. Déploiement ─────────────────────────────────────────────────────
+      - name: Espace de noms et secrets
+        env:
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          # Secrets générés une seule fois (jamais versionnés) ; conservés s'ils existent déjà
+          if ! kubectl -n "$NS" get secret ditstock-secrets >/dev/null 2>&1; then
+            kubectl -n "$NS" create secret generic ditstock-secrets \
+              --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)" \
+              --from-literal=SECRET_KEY="$(openssl rand -hex 32)" \
+              --from-literal=JWT_SECRET_KEY="$(openssl rand -hex 32)" \
+              --from-literal=DEMO_PASSWORD="${DEMO_PASSWORD:-Demo12345!}"
+            echo "Secret ditstock-secrets créé"
+          fi
+
+      - name: Appliquer les manifests (kubectl apply)
+        run: |
+          # Les manifests du dépôt contiennent DOCKERHUB_USERNAME et *_TAG : on y met les images choisies
+          mkdir -p rendu
+          for f in k8s/*.yaml; do
+            sed -e "s#DOCKERHUB_USERNAME/#${DOCKERHUB_USERNAME}/#" \
+                -e "s#:BACKEND_TAG#:${{ steps.images.outputs.backend_tag }}#" \
+                -e "s#:FRONTEND_TAG#:${{ steps.images.outputs.frontend_tag }}#" \
+                "$f" > "rendu/$(basename "$f")"
+          done
+          DEJA_DEPLOYE=$(kubectl -n "$NS" get deployment backend -o name 2>/dev/null || true)
+          kubectl apply -f rendu/
+          # Sur un cluster existant, « latest » ne change pas le manifest : on force le redéploiement
+          if [ -n "$DEJA_DEPLOYE" ] && { [ "${{ steps.images.outputs.backend_tag }}" = latest ] || [ "${{ steps.images.outputs.frontend_tag }}" = latest ]; }; then
+            kubectl -n "$NS" rollout restart deployment/backend deployment/frontend
+          fi
+
+      # ── 3. Vérifications post-déploiement ──────────────────────────────────
+      - name: Attendre la fin du déploiement (kubectl rollout status)
+        run: |
+          kubectl -n "$NS" rollout status deployment/database --timeout=300s
+          kubectl -n "$NS" rollout status deployment/backend --timeout=300s
+          kubectl -n "$NS" rollout status deployment/frontend --timeout=300s
+          kubectl -n "$NS" get deployments,pods,services,pvc -o wide
+
+      - name: Health check
+        run: |
+          # /health/ de l'API, vu depuis un pod backend
+          kubectl -n "$NS" exec deploy/backend -- python -c \
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/health/', timeout=5).read().decode())"
+          # Frontend servi par Nginx (NodePort 30080 → localhost:8080)
+          curl -fsS "$APP_URL/" | grep -q '<div id="root">' && echo "Frontend : OK"
+          # API à travers Nginx : sans jeton, 401 attendu
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/api/auth/me")
+          [ "$code" = 401 ] && echo "API via le frontend : OK (401 sans jeton)" || { echo "API : code $code"; exit 1; }
+
+      # ── 4. Persistance des données ─────────────────────────────────────────
+      - name: Vérifier la persistance des données (PVC)
+        env:
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+        run: |
+          set -o pipefail
+          login() {
+            curl -fsS -X POST "$APP_URL/api/auth/login" -H 'Content-Type: application/json' \
+              -d "{\"email\":\"admin@ditstock.local\",\"password\":\"${DEMO_PASSWORD:-Demo12345!}\"}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+          }
+          SKU="PERSIST-${GITHUB_RUN_ID}"
+          TOKEN=$(login)
+          curl -fsS -X POST "$APP_URL/api/products/" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"sku\":\"$SKU\",\"name\":\"Riz brisé 25 kg (test de persistance)\",\"unit_price\":12500,\"minimum_stock\":5}" >/dev/null
+          echo "Produit $SKU créé"
+
+          echo "Suppression du pod PostgreSQL et redéploiement de l'API…"
+          kubectl -n "$NS" delete pod -l app.kubernetes.io/name=database --wait=true
+          kubectl -n "$NS" rollout status deployment/database --timeout=180s
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app.kubernetes.io/name=database --timeout=180s
+          kubectl -n "$NS" rollout restart deployment/backend
+          kubectl -n "$NS" rollout status deployment/backend --timeout=300s
+
+          TOKEN=$(login)
+          if curl -fsS "$APP_URL/api/products/?q=$SKU" -H "Authorization: Bearer $TOKEN" | grep -q "$SKU"; then
+            echo "Persistance : OK — le produit $SKU est toujours là après le remplacement de la base"
+            echo "PERSISTANCE=OK" >> "$GITHUB_ENV"
+          else
+            echo "::error::Le produit $SKU a disparu après le redéploiement"; exit 1
+          fi
+
+      # ── 5. Mise à jour sans interruption ───────────────────────────────────
+      - name: Rolling update sous trafic (aucune requête en échec attendue)
+        run: |
+          # Trafic continu pendant le redéploiement : page d'accueil (200) et API (401 sans jeton)
+          : > trafic.log
+          (
+            while [ ! -f stop ]; do
+              echo "page $(curl -s -o /dev/null -m 5 -w '%{http_code}' "$APP_URL/")" >> trafic.log
+              echo "api  $(curl -s -o /dev/null -m 5 -w '%{http_code}' "$APP_URL/api/auth/me")" >> trafic.log
+              sleep 0.2
+            done
+          ) &
+          sleep 3
+          kubectl -n "$NS" rollout restart deployment/backend deployment/frontend
+          kubectl -n "$NS" rollout status deployment/backend --timeout=300s
+          kubectl -n "$NS" rollout status deployment/frontend --timeout=300s
+          sleep 3
+          touch stop; wait
+
+          TOTAL=$(wc -l < trafic.log)
+          ECHECS=$(grep -cvE '^(page 200|api  401)$' trafic.log || true)
+          echo "Requêtes pendant le rolling update : $TOTAL, en échec : $ECHECS"
+          sort trafic.log | uniq -c
+          kubectl -n "$NS" rollout history deployment/backend
+          kubectl -n "$NS" get pods -o wide
+          { echo "TRAFIC_TOTAL=$TOTAL"; echo "TRAFIC_ECHECS=$ECHECS"; } >> "$GITHUB_ENV"
+          [ "$ECHECS" = 0 ] || { echo "::error::$ECHECS requêtes en échec pendant la mise à jour"; exit 1; }
+
+      # ── 6. Notification ────────────────────────────────────────────────────
+      - name: Notification (résumé du déploiement)
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = success ]; then ETAT="✅ Déploiement réussi"; else ETAT="❌ Déploiement en échec"; fi
+          echo "::notice title=DitStock::$ETAT — backend ${{ steps.images.outputs.backend_tag }}, frontend ${{ steps.images.outputs.frontend_tag }}"
+          {
+            echo "## $ETAT"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Déclencheur | \`${{ github.event_name }}\` ${{ github.event.client_payload.composant }} |"
+            echo "| Image backend | \`${{ steps.images.outputs.backend }}\` |"
+            echo "| Image frontend | \`${{ steps.images.outputs.frontend }}\` |"
+            echo "| Persistance des données | ${PERSISTANCE:-non vérifiée} |"
+            echo "| Rolling update | ${TRAFIC_TOTAL:-?} requêtes pendant la mise à jour, ${TRAFIC_ECHECS:-?} en échec |"
+            echo
+            echo '```'
+            kubectl -n "$NS" get deployments,pods,services,pvc 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostic (en cas d'échec)
+        if: failure()
+        run: |
+          kubectl -n "$NS" get all,pvc -o wide || true
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
+          kubectl -n "$NS" describe pods | tail -80 || true
+          kubectl -n "$NS" logs deploy/backend --all-containers --tail=80 || true
+          kubectl -n "$NS" logs deploy/frontend --tail=40 || true

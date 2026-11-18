@@ -1,0 +1,7 @@
+# Espace de noms de l'application : toutes les ressources DitStock y sont regroupées.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ditstock
+  labels:
+    app.kubernetes.io/part-of: ditstock

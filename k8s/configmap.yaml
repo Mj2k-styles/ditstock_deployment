@@ -1,0 +1,15 @@
+# Configuration non secrète de l'API. Les secrets (mots de passe, clés) sont dans le
+# Secret ditstock-secrets, créé hors du dépôt : voir README.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ditstock-config
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/part-of: ditstock
+data:
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  GUNICORN_WORKERS: "2"
+  # Données de démonstration (comptes admin@, gestionnaire@, magasinier@ditstock.local)
+  SEED_DEMO: "1"

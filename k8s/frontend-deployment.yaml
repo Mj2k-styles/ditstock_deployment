@@ -1,0 +1,56 @@
+# Interface React servie par Nginx (image publiée par le dépôt ditstock_frontend).
+# Nginx relaie /api/ vers le Service backend. Même stratégie sans interruption que l'API.
+#
+# DOCKERHUB_USERNAME et FRONTEND_TAG sont remplacés par le pipeline CD.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: ditstock
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/part-of: ditstock
+    spec:
+      containers:
+        - name: frontend
+          image: DOCKERHUB_USERNAME/ditstock-frontend:FRONTEND_TAG
+          ports:
+            - containerPort: 80
+          env:
+            - name: BACKEND_URL
+              value: http://backend:5000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }

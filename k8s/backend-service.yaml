@@ -1,0 +1,15 @@
+# Adresse interne de l'API : backend:5000 (le frontend y relaie /api/).
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: ditstock
+spec:
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - port: 5000
+      targetPort: 5000

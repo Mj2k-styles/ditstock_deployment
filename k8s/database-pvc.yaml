@@ -1,0 +1,15 @@
+# Volume persistant de PostgreSQL : les données survivent aux redéploiements
+# et au remplacement du pod de la base.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-data
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: ditstock
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi

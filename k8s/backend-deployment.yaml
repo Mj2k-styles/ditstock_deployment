@@ -1,0 +1,116 @@
+# API Flask (image publiée sur Docker Hub par le dépôt ditstock_backend).
+#
+# Mise à jour sans interruption (rolling update) :
+#   - 2 répliques, maxUnavailable 0 : un nouveau pod doit être prêt (sonde /health/)
+#     avant qu'un ancien soit arrêté ;
+#   - preStop : le pod attend 5 s que le Service le retire avant de s'arrêter.
+#
+# DOCKERHUB_USERNAME et BACKEND_TAG sont remplacés par le pipeline CD
+# (ex. moncompte/ditstock-backend:sha-1a2b3c4).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: ditstock
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: ditstock
+    spec:
+      # Avant l'API : migrations de la base (et données de démonstration si SEED_DEMO=1).
+      # L'entrypoint de l'image s'en charge, puis exécute « true ».
+      initContainers:
+        - name: migrations
+          image: DOCKERHUB_USERNAME/ditstock-backend:BACKEND_TAG
+          args: ["true"]
+          envFrom:
+            - configMapRef:
+                name: ditstock-config
+          env:
+            - name: RUN_MIGRATIONS
+              value: "1"
+            - name: DEMO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: DEMO_PASSWORD
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: postgresql+psycopg2://ditstock:$(POSTGRES_PASSWORD)@db:5432/ditstock
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: SECRET_KEY
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: JWT_SECRET_KEY
+      containers:
+        - name: backend
+          image: DOCKERHUB_USERNAME/ditstock-backend:BACKEND_TAG
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: ditstock-config
+          env:
+            # Les migrations sont faites par l'initContainer
+            - name: SEED_DEMO
+              value: "0"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: postgresql+psycopg2://ditstock:$(POSTGRES_PASSWORD)@db:5432/ditstock
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: SECRET_KEY
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: JWT_SECRET_KEY
+          readinessProbe:
+            httpGet:
+              path: /health/
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/
+              port: 5000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+            limits: { memory: 512Mi }

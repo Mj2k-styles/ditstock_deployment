@@ -1,0 +1,61 @@
+# PostgreSQL 16. Une seule réplique : le volume (ReadWriteOnce) ne peut être monté
+# que par un pod à la fois, d'où la stratégie Recreate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+  namespace: ditstock
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: ditstock
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database
+        app.kubernetes.io/part-of: ditstock
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: ditstock
+            - name: POSTGRES_USER
+              value: ditstock
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ditstock-secrets
+                  key: POSTGRES_PASSWORD
+            # Sous-dossier : le point de montage d'un volume contient parfois lost+found
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ditstock", "-d", "ditstock"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ditstock", "-d", "ditstock"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: database-data
